@@ -21,6 +21,12 @@ class AccountTest {
     }
 
     @Test
+    void createdAtHasDatabasePrecision() {
+        // PostgreSQL keeps microseconds; anything finer would make a replayed response differ from the original.
+        assertThat(account("1").getCreatedAt().getNano() % 1_000).isZero();
+    }
+
+    @Test
     void rejectsNegativeOpeningBalance() {
         assertThatThrownBy(() -> account("-0.01")).isInstanceOf(IllegalArgumentException.class);
     }

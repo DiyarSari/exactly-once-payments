@@ -71,7 +71,7 @@ public class Transfer {
         this.description = description;
         this.status = status;
         this.failureReason = failureReason;
-        this.createdAt = Instant.now();
+        this.createdAt = Timestamps.now();
     }
 
     public static Transfer completed(String idempotencyKey, String requestHash, Account from, Account to,

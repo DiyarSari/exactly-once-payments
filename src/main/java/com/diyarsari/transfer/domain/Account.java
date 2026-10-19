@@ -57,7 +57,7 @@ public class Account {
         this.currency = Objects.requireNonNull(currency, "currency");
         this.balance = Money.of(openingBalance);
         this.openingBalance = this.balance;
-        this.createdAt = Instant.now();
+        this.createdAt = Timestamps.now();
     }
 
     public boolean canDebit(BigDecimal amount) {
