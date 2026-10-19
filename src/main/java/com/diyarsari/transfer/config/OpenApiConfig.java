@@ -12,7 +12,7 @@ public class OpenApiConfig {
     @Bean
     OpenAPI transferOpenApi() {
         return new OpenAPI().info(new Info()
-                .title("LedgerGuard API")
+                .title("Exactly-Once Payments API")
                 .version("1.0.0")
                 .description("Money transfers that are never applied twice and never overdraw an account.")
                 .license(new License().name("MIT").url("https://opensource.org/licenses/MIT")));

@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🛡️ LedgerGuard
+# Exactly-Once Payments
 
 **A banking transfer API that moves money exactly once, even when clients retry and requests race.**
 
-[![CI](https://github.com/DiyarSari/ledgerguard/actions/workflows/ci.yml/badge.svg)](https://github.com/DiyarSari/ledgerguard/actions/workflows/ci.yml)
+[![CI](https://github.com/DiyarSari/exactly-once-payments/actions/workflows/ci.yml/badge.svg)](https://github.com/DiyarSari/exactly-once-payments/actions/workflows/ci.yml)
 ![Java 21](https://img.shields.io/badge/Java-21-007396?logo=openjdk&logoColor=white)
 ![Spring Boot 3.5](https://img.shields.io/badge/Spring%20Boot-3.5-6DB33F?logo=springboot&logoColor=white)
 ![PostgreSQL 17](https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql&logoColor=white)
@@ -31,7 +31,7 @@ Moving money looks like two lines of code: subtract here, add there. In producti
 
 **🏎️ Race conditions.** Ayşe has 1,000 TRY. A standing order and a card payment of 800 TRY each arrive at the same millisecond. Both read `balance = 1000`, both pass the check, and both subtract. The result is an overdrawn account or a debit that silently disappears (a *lost update*).
 
-LedgerGuard implements the techniques that payment providers such as Stripe and Adyen, and PSD2 bank APIs, use to prevent both.
+This project implements the techniques that payment providers such as Stripe and Adyen, and PSD2 bank APIs, use to prevent both.
 
 ## How It Works
 
@@ -53,7 +53,7 @@ The client generates one key (usually a UUID) per **logical** transfer and sends
 sequenceDiagram
     autonumber
     participant App as Mobile app
-    participant API as LedgerGuard
+    participant API as Payments API
     participant DB as PostgreSQL
 
     App->>API: POST /api/transfers<br/>Idempotency-Key: 7f3c…  {1 → 2, 250.00}
@@ -117,8 +117,8 @@ These invariants are asserted after **every** integration test:
 You need **Java 21** and **Docker**.
 
 ```bash
-git clone https://github.com/DiyarSari/ledgerguard.git
-cd ledgerguard
+git clone https://github.com/DiyarSari/exactly-once-payments.git
+cd exactly-once-payments
 
 docker compose up -d        # PostgreSQL on localhost:5433
 ./mvnw spring-boot:run      # API on http://localhost:8080

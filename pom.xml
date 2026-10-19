@@ -11,9 +11,9 @@
     </parent>
 
     <groupId>com.diyarsari</groupId>
-    <artifactId>ledgerguard</artifactId>
+    <artifactId>exactly-once-payments</artifactId>
     <version>1.0.0</version>
-    <name>LedgerGuard</name>
+    <name>Exactly-Once Payments</name>
     <description>Money transfer API that never applies a transfer twice and never overdraws an account</description>
 
     <licenses>
