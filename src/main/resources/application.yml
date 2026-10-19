@@ -1,0 +1,46 @@
+spring:
+  application:
+    name: idempotent-transfer-api
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/transfers}
+    username: ${DB_USERNAME:transfer}
+    password: ${DB_PASSWORD:transfer}
+  jpa:
+    # Each transfer attempt must get a fresh persistence context, so the
+    # session must not be stretched across the whole HTTP request.
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        # UPDATEs are flushed sorted by primary key, so concurrent transfers
+        # always take row locks in the same (ascending id) order -> no deadlocks.
+        order_updates: true
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+  mvc:
+    problemdetails:
+      enabled: true
+
+server:
+  error:
+    include-stacktrace: never
+
+transfer:
+  retry:
+    max-attempts: 5
+    initial-backoff: 10ms
+    max-backoff: 200ms
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
