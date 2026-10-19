@@ -226,7 +226,7 @@ All errors are RFC 7807 `application/problem+json` with a machine-readable `erro
 ./mvnw verify     # unit tests + integration tests (needs Docker for Testcontainers)
 ```
 
-**83 tests**: 66 unit tests (`*Test`, Surefire) and 17 integration tests (`*IT`, Failsafe) against a real PostgreSQL 17 started by Testcontainers. No H2 and no mocked database, so locking and constraints behave exactly as in production.
+**84 tests**: 67 unit tests (`*Test`, Surefire) and 17 integration tests (`*IT`, Failsafe) against a real PostgreSQL 17 started by Testcontainers. No H2 and no mocked database, so locking and constraints behave exactly as in production.
 
 | Test | What it proves |
 |---|---|
