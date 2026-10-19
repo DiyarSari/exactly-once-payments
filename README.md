@@ -1,116 +1,132 @@
-# idempotent-transfer-api
+<div align="center">
 
-A money transfer API that **never applies a transfer twice** and **never overdraws an account**, even under retries and heavy concurrency.
+# 🛡️ LedgerGuard
 
-[![CI](https://github.com/DiyarSari/idempotent-transfer-api/actions/workflows/ci.yml/badge.svg)](https://github.com/DiyarSari/idempotent-transfer-api/actions/workflows/ci.yml)
+**A banking transfer API that moves money exactly once, even when clients retry and requests race.**
+
+[![CI](https://github.com/DiyarSari/ledgerguard/actions/workflows/ci.yml/badge.svg)](https://github.com/DiyarSari/ledgerguard/actions/workflows/ci.yml)
 ![Java 21](https://img.shields.io/badge/Java-21-007396?logo=openjdk&logoColor=white)
 ![Spring Boot 3.5](https://img.shields.io/badge/Spring%20Boot-3.5-6DB33F?logo=springboot&logoColor=white)
 ![PostgreSQL 17](https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-84%20passing-brightgreen)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+</div>
 
 ---
 
+## Highlights
+
+- **Exactly-once transfers.** An `Idempotency-Key` plus a stored request hash means retries and double taps never move money twice.
+- **No overdrafts under load.** Optimistic locking (`@Version`) with a bounded, jittered retry. Proven by a test that fires **50 parallel transfers** at one account.
+- **Deadlock-free by design.** Rows are always locked in ascending id order, so opposing transfers (A→B and B→A at once) cannot block each other.
+- **Double-entry ledger.** Every transfer books one DEBIT and one CREDIT in a single transaction. The ledger always sums to zero, and every balance can be rebuilt from it.
+- **Tested against real PostgreSQL.** 84 tests, with integration tests on Testcontainers rather than H2 or mocks. CI runs on every push.
+
 ## The Problem
 
-Moving money looks like two lines of code: subtract here, add there. In production, two things break it.
+Moving money looks like two lines of code: subtract here, add there. In production it breaks in two ways.
 
-**1. Duplicate transfers.** Ayşe sends 250 TRY rent from her mobile app. The request reaches the bank and the money moves, but the response gets lost in a train tunnel. The app times out and **retries automatically**, or Ayşe **taps "Send" again**. Without protection, the landlord gets 500 TRY and Ayşe gets an angry call to customer support.
+**💥 Duplicate transfers.** Ayşe sends 250 TRY rent from her mobile app. The bank moves the money, but the response is lost in a train tunnel. The app **retries after the timeout**, or Ayşe **taps "Send" again**. Without protection, the landlord receives 500 TRY.
 
-**2. Race conditions.** Ayşe has 1,000 TRY. Her standing order and a card payment hit the backend at the same millisecond. Both read `balance = 1000`, both check that 800 ≤ 1000, and both subtract. That is a classic *lost update*: the account ends up overdrawn or one debit silently disappears.
+**🏎️ Race conditions.** Ayşe has 1,000 TRY. A standing order and a card payment of 800 TRY each arrive at the same millisecond. Both read `balance = 1000`, both pass the check, and both subtract. The result is an overdrawn account or a debit that silently disappears (a *lost update*).
 
-This service shows the standard techniques banks and payment providers (Stripe, Adyen, PSD2 APIs) use to stop both.
+LedgerGuard implements the techniques that payment providers such as Stripe and Adyen, and PSD2 bank APIs, use to prevent both.
 
 ## How It Works
 
-### 1. Idempotency keys: "the same request means the same result"
+### 1. Idempotency keys: same request, same result
 
-Every `POST /api/transfers` carries an `Idempotency-Key` header, a unique value (usually a UUID) that the **client generates once per logical transfer** and reuses on every retry.
+The client generates one key (usually a UUID) per **logical** transfer and sends it on every retry.
 
-| Situation | Result |
+| Request | Response |
 |---|---|
-| New key | Transfer runs; result stored together with the key |
-| Same key + same body | **Stored result returned**, no money moves, header `Idempotent-Replayed: true` |
-| Same key + different body | `422 Unprocessable Entity` (a client bug: one key, two different intents) |
-| Missing key | `400 Bad Request` |
+| New key | Transfer runs; the outcome is stored with the key |
+| Same key + same body | **Stored result returned**, no money moved, header `Idempotent-Replayed: true` |
+| Same key + different body | `422 Unprocessable Entity` (one key, two different intents) |
+| No key | `400 Bad Request` |
 
-The key is stored on the transfer row behind a **`UNIQUE` constraint**. If two copies of the same request arrive at exactly the same time, both may miss the first lookup, but only one `INSERT` can win. The loser's transaction rolls back (including its balance changes), and it answers with the winner's stored result.
-
-To tell "same body" from "different body", the service stores a **SHA-256 hash of a canonical form** of the request (`from|to|amount|description`, with the amount normalised to 2 decimals). Formatting differences such as `100` vs `100.00`, whitespace or field order count as the same request.
+- **Simultaneous duplicates:** the key column has a `UNIQUE` constraint. When two copies arrive at the same instant, only one `INSERT` can commit. The other transaction rolls back, including its balance changes, and returns the winner's result.
+- **"Same body" means the same transfer:** the service stores a **SHA-256 of a canonical form** of the request (`from|to|amount|description`, amount normalised to 2 decimals), so `100` and `100.00` count as the same request.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant App as Mobile app
-    participant API as Transfer API
+    participant API as LedgerGuard
     participant DB as PostgreSQL
 
     App->>API: POST /api/transfers<br/>Idempotency-Key: 7f3c…  {1 → 2, 250.00}
     API->>DB: find transfer by key → none
-    API->>DB: BEGIN; debit 1, credit 2, 2 ledger entries,<br/>insert transfer(key, requestHash); COMMIT
-    API--xApp: 201 Created (response lost: timeout)
+    API->>DB: BEGIN · debit 1 · credit 2 · 2 ledger entries ·<br/>insert transfer(key, requestHash) · COMMIT
+    API--xApp: 201 Created (lost: network timeout)
 
-    Note over App: Network timeout → app retries<br/>with the SAME key and body
+    Note over App: App retries with the<br/>SAME key and body
 
     App->>API: POST /api/transfers<br/>Idempotency-Key: 7f3c…  {1 → 2, 250.00}
     API->>DB: find transfer by key → found
     API->>API: hash(request) == stored requestHash ✔
-    API-->>App: 201 Created, same transfer id<br/>Idempotent-Replayed: true (no money moved)
+    API-->>App: 201 Created · same transfer id<br/>Idempotent-Replayed: true (no money moved)
 ```
 
-### 2. Optimistic locking with bounded retry: "no lost updates"
+### 2. Optimistic locking: no lost updates
 
-`Account` has a JPA `@Version` column. Every balance update runs as
+Every balance change is a conditional update:
 
 ```sql
 UPDATE accounts SET balance = ?, version = version + 1 WHERE id = ? AND version = ?
 ```
 
-If another transaction changed the account in the meantime, zero rows match, Hibernate throws an optimistic-lock exception and **the whole transaction rolls back**. `TransferService` then retries the transfer in a **brand-new transaction** that re-reads fresh balances, up to 5 attempts with exponential backoff and full jitter. If all attempts lose, the client gets `409 Conflict` and can retry safely **with the same Idempotency-Key**.
+- **Conflict:** if another transaction got there first, zero rows match and the whole transaction rolls back.
+- **Retry:** the service retries in a **fresh transaction** with fresh balances, up to 5 times with exponential backoff and full jitter.
+- **Still losing:** the client receives `409 Conflict` and can safely retry **with the same key**.
+- **Deadlock avoidance:** accounts are loaded in id order, and `hibernate.order_updates=true` flushes updates sorted by primary key.
+- **Defence in depth:** PostgreSQL itself enforces `CHECK (balance >= 0)`.
 
-**Deadlock avoidance.** Accounts are loaded in ascending id order, and `hibernate.order_updates=true` makes Hibernate flush the `UPDATE`s sorted by primary key. Two opposing transfers (A→B and B→A) therefore always lock rows in the same order, so a circular wait cannot happen. A dedicated test fires 40 opposing transfers at once to prove it.
+### 3. Double-entry ledger: money is moved, never created
 
-**Defence in depth.** Besides the application check, PostgreSQL enforces `CHECK (balance >= 0)`, so even a bug in the code could not commit an overdraft.
+A completed transfer writes two immutable entries in **one transaction**, together with both balance updates and the transfer record:
 
-### 3. Double-entry ledger: "money is moved, never created"
+```
+transfer ef66…  250.00 TRY
+  DEBIT   account 1   250.00   balance after 9,750.00
+  CREDIT  account 2   250.00   balance after 5,250.00
+```
 
-Each completed transfer writes exactly **two immutable ledger entries**: a `DEBIT` on the source and a `CREDIT` on the target, for the same amount. All of it (both balance updates, both ledger entries and the transfer record) commits in **one database transaction**, or none of it does.
-
-Invariants that the test suite checks after every test:
+These invariants are asserted after **every** integration test:
 
 - Σ credits − Σ debits = **0** per currency
-- every `COMPLETED` transfer has exactly one matching DEBIT and one CREDIT; every `REJECTED` transfer has none
-- every account balance = opening balance + its ledger entries
+- each `COMPLETED` transfer has exactly one matching DEBIT and one CREDIT; each `REJECTED` transfer has none
+- each balance = opening balance + its ledger entries
 - no balance is negative
 
 ## Tech Stack
 
 | Area | Choice |
 |---|---|
-| Language / runtime | Java 21 |
+| Language | Java 21 |
 | Framework | Spring Boot 3.5 (Web, Data JPA, Validation, Actuator) |
-| Database | PostgreSQL 17, schema managed by Flyway |
-| API docs | springdoc-openapi (Swagger UI) |
-| Errors | RFC 7807 `ProblemDetail` via a global exception handler |
+| Database | PostgreSQL 17, Flyway migrations |
+| API docs | springdoc-openapi / Swagger UI |
+| Errors | RFC 7807 `ProblemDetail`, global exception handler |
 | Testing | JUnit 5, AssertJ, Mockito, MockMvc, Testcontainers |
-| Build / CI | Maven Wrapper, GitHub Actions |
+| Build & CI | Maven Wrapper, GitHub Actions |
 
 ## Quick Start
 
-Prerequisites: **Java 21** and **Docker**.
+You need **Java 21** and **Docker**.
 
 ```bash
-git clone https://github.com/DiyarSari/idempotent-transfer-api.git
-cd idempotent-transfer-api
+git clone https://github.com/DiyarSari/ledgerguard.git
+cd ledgerguard
 
 docker compose up -d        # PostgreSQL on localhost:5433
 ./mvnw spring-boot:run      # API on http://localhost:8080
 ```
 
-- Swagger UI: **http://localhost:8080/swagger-ui.html**
-- OpenAPI JSON: http://localhost:8080/v3/api-docs
-- Health: http://localhost:8080/actuator/health
+👉 **Swagger UI: http://localhost:8080/swagger-ui.html**
 
-A Flyway migration seeds three demo accounts:
+Three demo accounts are seeded by a Flyway migration:
 
 | id | Owner | IBAN | Balance |
 |---|---|---|---|
@@ -118,7 +134,7 @@ A Flyway migration seeds three demo accounts:
 | 2 | Mehmet Demir | TR53 9999 9000 0000 0000 0000 02 | 5,000.00 TRY |
 | 3 | Zeynep Kaya | TR26 9999 9000 0000 0000 0000 03 | 2,500.00 TRY |
 
-> The container is published on host port **5433** so it does not clash with a locally installed PostgreSQL. Override with `DB_URL`, `DB_USERNAME`, `DB_PASSWORD`.
+> PostgreSQL is published on host port **5433** so it does not clash with a local installation. Override it with `DB_URL`, `DB_USERNAME` and `DB_PASSWORD`.
 
 ## API
 
@@ -126,7 +142,7 @@ A Flyway migration seeds three demo accounts:
 |---|---|---|
 | `POST` | `/api/accounts` | Open an account with an initial balance |
 | `GET` | `/api/accounts/{id}` | Account details and balance |
-| `GET` | `/api/accounts/{id}/ledger?page=0&size=20` | Ledger entries, newest first (max size 100) |
+| `GET` | `/api/accounts/{id}/ledger?page=0&size=20` | Ledger entries, newest first |
 | `POST` | `/api/transfers` | Transfer money (**requires `Idempotency-Key`**) |
 | `GET` | `/api/transfers/{id}` | Transfer details |
 
@@ -144,26 +160,24 @@ HTTP/1.1 201
 Idempotent-Replayed: false
 
 {"id":"ef669db4-b14d-4a5d-a1af-bb92fe94e533","fromAccountId":1,"toAccountId":2,"amount":250.00,
- "currency":"TRY","description":"Rent","status":"COMPLETED","failureReason":null,"createdAt":"2026-10-19T12:17:41.184324Z"}
+ "currency":"TRY","description":"Rent","status":"COMPLETED","failureReason":null,...}
 ```
 
-Run **exactly the same command again** (simulating a retry):
+Run **the exact same command again**, as if the app retried:
 
 ```http
 HTTP/1.1 201
 Idempotent-Replayed: true
 
-{"id":"ef669db4-b14d-4a5d-a1af-bb92fe94e533", ... "status":"COMPLETED" ...}   ← same transfer id
+{"id":"ef669db4-b14d-4a5d-a1af-bb92fe94e533", ... "status":"COMPLETED" ...}   ← same transfer
 ```
-
-The balances changed only once:
 
 ```bash
 curl -s http://localhost:8080/api/accounts/1   # "balance": 9750.00  (not 9500.00)
 curl -s http://localhost:8080/api/accounts/2   # "balance": 5250.00  (not 5500.00)
 ```
 
-### Reuse a key with a different body → 422
+### Same key, different body → 422
 
 ```bash
 curl -i -X POST http://localhost:8080/api/transfers \
@@ -183,101 +197,113 @@ curl -i -X POST http://localhost:8080/api/transfers \
 }
 ```
 
-### Insufficient funds → stored as `REJECTED`
+### Insufficient funds → recorded as `REJECTED`
 
 ```bash
 curl -s -X POST http://localhost:8080/api/transfers \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-0002' \
   -d '{"fromAccountId":3,"toAccountId":1,"amount":99999.00}'
-```
-
-```json
-{"id":"8ee44a00-…","fromAccountId":3,"toAccountId":1,"amount":99999.00,"currency":"TRY",
- "status":"REJECTED","failureReason":"INSUFFICIENT_FUNDS", ...}
-```
-
-### Other calls
-
-```bash
-# Open an account (currency defaults to TRY)
-curl -s -X POST http://localhost:8080/api/accounts \
-  -H 'Content-Type: application/json' \
-  -d '{"ownerName":"Ali Veli","initialBalance":1000.00}'
-
-# Ledger of account 1
-curl -s 'http://localhost:8080/api/accounts/1/ledger?page=0&size=10'
+# → {"status":"REJECTED","failureReason":"INSUFFICIENT_FUNDS", ...}
 ```
 
 ### Error responses
 
-All errors are RFC 7807 `application/problem+json` with a machine-readable `errorCode`:
+Every error is `application/problem+json` (RFC 7807) with a machine-readable `errorCode`:
 
 | Status | When | `errorCode` |
 |---|---|---|
 | 400 | Missing `Idempotency-Key`, malformed JSON | `BAD_REQUEST` |
-| 400 | Invalid fields (`amount ≤ 0`, more than 2 decimals, `from == to`, ...); field messages in `errors` | `VALIDATION_FAILED` |
-| 404 | Account or transfer does not exist | `NOT_FOUND` |
-| 409 | Optimistic-lock retries exhausted (safe to retry with the same key) | `CONCURRENT_MODIFICATION` |
-| 422 | Idempotency key reused with a different body | `IDEMPOTENCY_KEY_REUSED` |
+| 400 | Invalid fields (`amount ≤ 0`, more than 2 decimals, `from == to`, …); details in `errors` | `VALIDATION_FAILED` |
+| 404 | Unknown account or transfer | `NOT_FOUND` |
+| 409 | Lock retries exhausted (safe to retry with the same key) | `CONCURRENT_MODIFICATION` |
+| 422 | Key reused with a different body | `IDEMPOTENCY_KEY_REUSED` |
 
 ## Testing
 
 ```bash
-./mvnw verify     # unit tests + integration tests (needs Docker for Testcontainers)
+./mvnw verify    # 67 unit tests + 17 integration tests (Docker required)
 ```
 
-**84 tests**: 67 unit tests (`*Test`, Surefire) and 17 integration tests (`*IT`, Failsafe) against a real PostgreSQL 17 started by Testcontainers. No H2 and no mocked database, so locking and constraints behave exactly as in production.
-
-| Test | What it proves |
+| Suite | Proves |
 |---|---|
-| `AccountTest`, `TransferRulesTest` | Debit/credit, overdraft refusal, currency mismatch, scale-2 money |
-| `RequestValidationTest` | Bean Validation: positive amounts, 2 decimals, `from ≠ to`, ISO currency |
-| `TransferServiceTest` | Retries on optimistic-lock conflict, gives up after N attempts, duplicate-key race returns the winner's result |
-| `TransferControllerTest` | HTTP contract: 400 / 409 / 422 problem responses, `Idempotent-Replayed` header |
-| `IdempotencyIT` | Same key twice → money moves **once**; same key + different body → **422**; 10 *concurrent* requests with one key → one transfer |
-| `ConcurrencyIT` | 50 parallel transfers; opposing transfers without deadlock |
-| `LedgerInvariantIT` | Runs **last**; the ledger sums to zero over everything the suite wrote |
+| `AccountTest`, `TransferRulesTest` | Overdraft refusal, currency mismatch, exact scale-2 money |
+| `RequestValidationTest` | Positive amounts, max 2 decimals, `from ≠ to`, ISO 4217 currency |
+| `TransferServiceTest` | Retry on lock conflict, bounded attempts, duplicate-key race handling |
+| `TransferControllerTest` | HTTP contract: 400 / 409 / 422 problems, replay header |
+| `IdempotencyIT` | Same key twice → money moves **once**; different body → **422**; 10 *simultaneous* identical requests → one transfer |
+| `ConcurrencyIT` | 50 parallel transfers; 40 opposing transfers without deadlock |
+| `LedgerInvariantIT` | Runs last: the ledger sums to zero over everything the suite wrote |
 
 ### What the concurrency test proves
 
-`ConcurrencyIT.fiftyParallelTransfersNeverOverdrawTheAccount` creates an account with **1,000.00 TRY** and releases **50 threads at once** (a `CountDownLatch` start gate), each sending a 100.00 TRY transfer over real HTTP with its own idempotency key. That is 5,000 TRY of demand against 1,000 TRY of funds.
+The test opens an account with **1,000.00 TRY** and releases **50 threads at the same instant** (`CountDownLatch`). Each thread sends a 100.00 TRY transfer over real HTTP, so 5,000 TRY of demand meets 1,000 TRY of funds:
 
-The test asserts:
+```
+50 parallel transfers: 10 completed, 40 rejected
+```
 
-- exactly **10 transfers `COMPLETED`** and **40 `REJECTED`** (`INSUFFICIENT_FUNDS`): no more, no fewer
-- the source balance ends at exactly **0.00**, never negative
-- the targets received exactly 1,000.00 together
-- the **total money across all accounts is unchanged**
-- the ledger invariants still hold
+- exactly **10 `COMPLETED`** and **40 `REJECTED`**: no more, no fewer
+- final source balance is exactly **0.00**, never negative
+- **total money in the system is unchanged**
+- all ledger invariants still hold
 
-Without `@Version`, several threads would read the same balance and the test would see more than 10 completions and a negative balance (or a CHECK-constraint failure).
+Remove `@Version` and the same test fails: concurrent threads read the same balance, and either too many transfers complete or the database's `CHECK` constraint has to stop them.
 
 ## Design Decisions & Trade-offs
 
-**Optimistic vs pessimistic locking.** Pessimistic locking (`SELECT … FOR UPDATE`) serialises access and never needs retries, but it holds row locks for the whole transaction and is prone to lock queues on hot accounts. Optimistic locking holds no locks while reading and only fails when a real conflict happens, which fits the common case of transfers touching different accounts. The trade-off is retries under heavy contention on a single account; they are bounded (5 attempts with jitter), and the idempotency key makes a client-side retry after a `409` safe. For a few extremely hot accounts (for example a merchant settlement account), `PESSIMISTIC_WRITE` on that path would be the pragmatic switch.
+<details open>
+<summary><b>Optimistic vs pessimistic locking</b></summary>
 
-**Why `BigDecimal` (and `NUMERIC(19,2)`).** `0.1 + 0.2` is `0.30000000000000004` in binary floating point. Money must be exact, so amounts are `BigDecimal` end to end, normalised to scale 2 with `RoundingMode.UNNECESSARY`: an amount that would need rounding is an error, never silently changed. Requests with more than 2 decimals are rejected at validation.
+`SELECT … FOR UPDATE` never needs retries, but it holds row locks for the whole transaction and builds queues on busy accounts. Optimistic locking takes no locks while reading and only pays a cost on a real conflict, which suits the common case of transfers touching different accounts. The price is retries on a single hot account. Those retries are bounded, and the idempotency key makes a client retry after `409` safe. For a few extremely hot accounts (for example merchant settlement), switching that path to `PESSIMISTIC_WRITE` would be the pragmatic choice.
+</details>
 
-**Why store a request hash.** Without it, a client that accidentally reuses a key for a *different* transfer would silently get the old result back and believe its new transfer succeeded. Comparing a SHA-256 of the canonical request turns that bug into an explicit `422`. Hashing the parsed values, not the raw bytes, means harmless formatting differences do not trigger false conflicts, and the stored value has a fixed size whatever the body size.
+<details open>
+<summary><b>Why BigDecimal</b></summary>
 
-**Rejections are stored and replayed.** A transfer that fails a business rule (`INSUFFICIENT_FUNDS`, `CURRENCY_MISMATCH`) is persisted as `REJECTED` and returned with `201`. Replaying its key returns the same rejection, even if the account was funded later: the key identifies an *attempt* whose outcome has been decided. Malformed requests (`400`) and unknown accounts (`404`) are *not* stored, so the client can fix the request and reuse the key.
+In binary floating point, `0.1 + 0.2 = 0.30000000000000004`. Money is `BigDecimal` end to end and `NUMERIC(19,2)` in the database, normalised with `RoundingMode.UNNECESSARY`, so an amount that would need rounding is an error and is never silently changed.
+</details>
 
-**Retry loop outside the transaction.** `TransferService` (no transaction) loops around `TransferProcessor.execute` (`@Transactional`). Each attempt therefore gets a fresh transaction and persistence context; `spring.jpa.open-in-view` is disabled so no stale entities survive between attempts.
+<details open>
+<summary><b>Why store a request hash</b></summary>
 
-**Opening balances.** Initial deposits are recorded as the account's `opening_balance` instead of as ledger entries against a funding account. This keeps the demo focused on transfers; the reconciliation check `balance = opening_balance + Σ entries` still makes every account auditable.
+Without it, a client that accidentally reuses a key for a *different* transfer would get the old result back and believe the new transfer succeeded. Comparing hashes turns that silent bug into an explicit `422`. The hash is computed from the parsed values, not the raw bytes, so formatting differences do not cause false conflicts, and the stored value has a fixed size.
+</details>
 
-**Smaller decisions.** Account ids are sequential `BIGINT`s (readable in demos, natural lock ordering); transfer ids are random UUIDs (not guessable). Idempotency keys are globally unique here; a multi-tenant system would scope them per client. IBANs follow the Turkish format with valid mod-97 check digits and a fictional bank code `99999`. Accounts may be opened in any ISO 4217 currency; transfers only run between accounts with the same currency.
+<details>
+<summary><b>More decisions</b></summary>
+
+- **Rejections are stored.** `INSUFFICIENT_FUNDS` and `CURRENCY_MISMATCH` are saved as `REJECTED`, and replaying the key returns the same rejection: the key identifies an attempt whose outcome is already decided. Invalid requests (400) and unknown accounts (404) are not stored, so the client can fix the request and reuse the key.
+- **Retry loop outside the transaction.** `TransferService` loops around the `@Transactional` `TransferProcessor`, so every attempt gets a fresh persistence context. `open-in-view` is disabled for the same reason.
+- **Timestamps truncated to microseconds** to match PostgreSQL, so a replayed response is byte-identical to the original. CI on Linux caught this; macOS clocks hide it.
+- **Opening balances** are stored on the account rather than as ledger entries against a funding account. This keeps the demo focused while every balance stays reconcilable.
+- **Ids:** sequential `BIGINT` for accounts (readable, natural lock order), random UUIDs for transfers (not guessable).
+- **IBANs** use the Turkish format with valid mod-97 check digits and a fictional bank code `99999`.
+- **Idempotency keys** are globally unique here; a multi-tenant system would scope them per client.
+</details>
+
+## Project Structure
+
+```
+src/main/java/com/diyarsari/transfer
+├── controller/   REST endpoints (accounts, transfers)
+├── service/      TransferService (retry loop) · TransferProcessor (one transaction) · RequestHasher
+├── domain/       Account · Transfer · LedgerEntry · TransferRules (pure business rules)
+├── repository/   Spring Data JPA repositories
+├── dto/          Request/response records with Bean Validation
+├── exception/    Domain exceptions + RFC 7807 GlobalExceptionHandler
+└── config/       Retry settings, OpenAPI
+src/main/resources/db/migration   Flyway schema + demo seed
+```
 
 ## Possible Improvements
 
-- **Transactional outbox**: write a `TransferCompleted` event in the same transaction and publish it to Kafka from a relay, so notifications and fraud checks never miss or double-publish an event.
-- **Multi-currency transfers**: FX quotes with expiry, a rate stored on the transfer, and ledger entries in both currencies through a currency-exchange account.
-- **Idempotency key expiry**: keep keys for 24–72 hours (as Stripe does) and archive old ones instead of keeping them forever.
-- **Authentication and authorisation**: OAuth2 / JWT with Spring Security; only an account's owner can debit it; scope idempotency keys per client.
-- **Rate limiting**: per client and per account (Bucket4j or an API gateway) to protect hot accounts and the retry budget.
-- **Observability**: Micrometer metrics for retry count, conflicts and replays; distributed tracing with OpenTelemetry.
-- **Hot-account strategy**: switch to pessimistic locking or sharded sub-balances for accounts with very high write rates.
+- **Transactional outbox:** publish `TransferCompleted` events to Kafka reliably, with no lost or duplicate events.
+- **Multi-currency:** FX quotes with expiry and a currency-exchange ledger account.
+- **Idempotency key expiry:** keep keys for 24–72 h, then archive them.
+- **Auth:** Spring Security with OAuth2/JWT; only owners can debit; keys scoped per client.
+- **Rate limiting:** per client and per account (Bucket4j or an API gateway).
+- **Observability:** Micrometer metrics for retries, conflicts and replays; OpenTelemetry tracing.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) © Diyar Sari
