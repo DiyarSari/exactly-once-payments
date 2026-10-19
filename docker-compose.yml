@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:17-alpine
-    container_name: transfer-postgres
+    container_name: ledgerguard-postgres
     environment:
       POSTGRES_DB: transfers
       POSTGRES_USER: transfer
@@ -9,7 +9,7 @@ services:
     ports:
       - "5433:5432"   # 5433 on the host to avoid clashing with a locally installed PostgreSQL
     volumes:
-      - transfer-pgdata:/var/lib/postgresql/data
+      - ledgerguard-pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U transfer -d transfers"]
       interval: 5s
@@ -17,4 +17,4 @@ services:
       retries: 10
 
 volumes:
-  transfer-pgdata:
+  ledgerguard-pgdata:

@@ -11,9 +11,9 @@
     </parent>
 
     <groupId>com.diyarsari</groupId>
-    <artifactId>idempotent-transfer-api</artifactId>
+    <artifactId>ledgerguard</artifactId>
     <version>1.0.0</version>
-    <name>idempotent-transfer-api</name>
+    <name>LedgerGuard</name>
     <description>Money transfer API that never applies a transfer twice and never overdraws an account</description>
 
     <licenses>
